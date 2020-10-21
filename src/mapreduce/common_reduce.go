@@ -1,5 +1,15 @@
 package mapreduce
 
+
+import (
+    "fmt"
+    "os"
+    "encoding/json"
+    "log"
+    "sort"
+    //"bufio"
+)
+
 func doReduce(
 	jobName string, // the name of the whole MapReduce job
 	reduceTask int, // which reduce task this is
@@ -7,6 +17,8 @@ func doReduce(
 	nMap int, // the number of map tasks that were run ("M" in the paper)
 	reduceF func(key string, values []string) string,
 ) {
+    fmt.Printf("doReduce: jobName: %s, reduceTask: %d, nMap: %d, outFile %s\n",
+            jobName, reduceTask, nMap, outFile)
 	//
 	// doReduce manages one reduce task: it should read the intermediate
 	// files for the task, sort the intermediate key/value pairs by key,
@@ -44,4 +56,55 @@ func doReduce(
 	//
 	// Your code here (Part I).
 	//
+
+    // read temp file first
+    var kvs = make(map[string][]string)
+    var fileNames = make([]*os.File, nMap)
+    
+    var akv KeyValue
+    var keysForSort []string
+    // tempFileName := fmt.Sprintf("mrtmp.test-res-%d-%d", nMap, reduceTask)
+    for fileCount := 0; fileCount < nMap; fileCount++ {
+        tempFileName := reduceName(jobName, fileCount, reduceTask)
+        aTempFiles, err := os.Open(tempFileName) 
+        fileNames[fileCount] = aTempFiles
+        defer fileNames[fileCount].Close()
+        if err != nil {
+            fmt.Printf("open file %s failed!\n", tempFileName)
+        }
+
+        enc := json.NewDecoder(aTempFiles)
+        for  {
+            err := enc.Decode(&akv)
+            // fmt.Println("decoder")
+            // fmt.Println(akv)
+            // kvs = append(kvs, amap)
+            kvs[akv.Key] = append(kvs[akv.Key], akv.Value)
+            keysForSort = append(keysForSort, akv.Key)
+            if err != nil {
+                break
+            }
+        }
+    }
+    //fmt.Println(kvs)
+    
+    // sort
+    sort.Strings(keysForSort)
+    //fmt.Println("doReduce finished")
+
+    // write input file by current reducer!
+    // name := fmt.Sprintf("mrtmp.test-res-%d", reduceTask)
+    outputFile, err := os.Create(outFile)
+    if err != nil {
+        log.Fatalf("2 file %s not exites!\n", outFile)
+    }
+    defer outputFile.Close()
+    // write result contents
+    enc2 := json.NewEncoder(outputFile)
+    for _, key := range keysForSort {
+        values := reduceF(key, kvs[key])
+        akv.Key = key
+        akv.Value = values
+        enc2.Encode(&akv)
+    }
 }
