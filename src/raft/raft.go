@@ -19,8 +19,8 @@ package raft
 
 import (
 	"../labrpc"
-	"math"
 	"fmt"
+	"math"
 	"math/rand"
 	"sync"
 	"time"
@@ -83,7 +83,7 @@ type Raft struct {
 	currentTerm  int
 	votedTerm    int
 	voteEachTerm []int
-	msg          []interface{}
+	logs         []interface{}
 
 	/*
 	 * 已知已提交的最高的日志条目的索引（初始值为0，单调递增）
@@ -115,6 +115,7 @@ type Raft struct {
 	heartBeatChan chan ApplyMsg
 	applyCh chan ApplyMsg
 	stopChan chan bool
+	retryChan chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -189,9 +190,9 @@ type RequestAppendEntryArgs struct {
 	LeaderId     int
 	PrevLogIndex int
 	PrevLogTerm  int
-	Msg 		interface{}
+	Log          interface{}
  	LeaderCommit int
-	MsgId 		int
+	LogId        int
 }
 
 type RequestAppendEntryReply struct {
@@ -229,30 +230,35 @@ func (rf *Raft) RequestAppendEntry(args *RequestAppendEntryArgs, reply *RequestA
 		rf.currentTerm = args.Term
 	}
 
-	if args.Msg == LEADER_HEARTBEAT {
+	if args.Log == LEADER_HEARTBEAT {
+		// fmt.Printf("%d receive heartbeat, LeaderCommit: %+v\n", rf.me, args.LeaderCommit)
 		rf.heartBeatChan <- ApplyMsg{
 			CommandValid: true,
-			Command:      args,
-			CommandIndex: args.MsgId,
+			Command:      args.LeaderCommit,
+			CommandIndex: args.LogId,
 		}
-		return
 	} else {
-		// fmt.Printf("from %d pos %d to %d pos %d, arg: %+v\n", args.LeaderId, args.MsgId, rf.me, rf.commitIndex, args)
-		if rf.commitIndex == args.MsgId {
-
-			rf.applyCh <- ApplyMsg{
-				CommandValid: true,
-				Command:      args.Msg,
-				CommandIndex: args.MsgId,
-			}
-			rf.msg[rf.commitIndex] = args.Msg
+		if rf.commitIndex == args.LogId {
+			rf.logs[rf.commitIndex] = args.Log
 			rf.commitIndex += 1
 			reply.Success = true
 			reply.Term = rf.currentTerm
-			// fmt.Printf("applyCh[%d][%d] %d, rep: %+v\n", rf.me, args.MsgId, args.Msg, reply)
+			fmt.Printf("rf.logs[%d][%d] %d, arg: %+v, rep: %+v\n", rf.me, args.LogId, args.Log, args, reply)
+		} else if rf.commitIndex > args.LogId {
+			// 收到了一个过去的log
+			if rf.logs[args.LogId] == args.Log {
+				reply.Success = true
+				reply.Term = rf.currentTerm
+				// fmt.Printf("%d received a past log %+v and return success: %+v, %p\n", rf.me, args, reply, reply)
+			} else {
+				reply.Success = false
+				reply.Term = rf.currentTerm
+				// fmt.Printf("from %d[%d] to %d[%d], arg: %+v, reply: %v, %p\n", args.LeaderId, args.LogId, rf.me, rf.commitIndex, args, reply, reply)
+			}
 		} else {
 			reply.Success = false
 			reply.Term = rf.currentTerm
+			// fmt.Printf("from %d[%d] to %d[%d], arg: %+v, reply: %v, %p\n", args.LeaderId, args.LogId, rf.me, rf.commitIndex, args, reply, reply)
 		}
 	}
 }
@@ -286,8 +292,8 @@ func (rf *Raft) RequestAppendEntry(args *RequestAppendEntryArgs, reply *RequestA
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply interface{}) bool {
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply.(*RequestVoteReply))
 	return ok
 }
 
@@ -303,18 +309,19 @@ func (rf *Raft) sendRequestAppendEntry(server int, args interface{}, reply *Requ
 	case <- done:
 		return true
 	case <- time.After(time.Millisecond * time.Duration(NET_TIMEOUT)):
+		reply.Success = false
 		return false
 	}
 }
 
 func (rf *Raft) sendHistoryMsgs(who int, begin int) {
-	//fmt.Printf("%d sendHistoryMsgs to %d, endEntry: %d\n", rf.me, who, begin)
-	for i := begin; i >= 0; i -= 1 {
+	// fmt.Printf("%d sendHistoryMsgs to %d, endEntry: %d\n", rf.me, who, begin)
+	for i := begin; i > 0; i -= 1 {
 		replies := rf.sendMsg(MSG_APPLY_ENTRY, &RequestAppendEntryArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			Msg:          rf.msg[i],
-			MsgId:        i,
+			Term:     rf.currentTerm,
+			LeaderId: rf.me,
+			Log:      rf.logs[i],
+			LogId:    i,
 		}, i, who)
 		rpy := replies[0].(*RequestAppendEntryReply)
 		if !rpy.Success {
@@ -323,12 +330,13 @@ func (rf *Raft) sendHistoryMsgs(who int, begin int) {
 		// fmt.Printf("start sync at port: %d\n", i + 1)
 		for syncPot := i + 1; syncPot <= begin; syncPot += 1 {
 			rf.sendMsg(MSG_APPLY_ENTRY, &RequestAppendEntryArgs{
-				Term:         rf.currentTerm,
-				LeaderId:     rf.me,
-				Msg:          rf.msg[syncPot],
-				MsgId:        syncPot,
+				Term:     rf.currentTerm,
+				LeaderId: rf.me,
+				Log:      rf.logs[syncPot],
+				LogId:    syncPot,
 			}, i, who)
 		}
+		rf.sendMsg(MSG_HERATBEAT, nil, NO_MSG_ID, who)
 		return
 	}
 }
@@ -361,14 +369,71 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			rep := replies[i].(*RequestAppendEntryReply)
 			// fmt.Printf("start %d -> %d rep %+v\n", rf.me, i, rep)
 			if !rep.Success {
+				rf.nextIndex[i] = index - 1
 				go rf.sendHistoryMsgs(i, index)
 			} else {
+				rf.nextIndex[i] = index
 				successNum += 1
 			}
 		}
 
-		if successNum > len(rf.peers) / 2 {
+		if successNum <= len(rf.peers)/2 {
+			fmt.Printf("apply failed and retry, command: %d, index: %d, successNum: %d\n", command.(int), index, successNum)
+			rf.retryChan <- ApplyMsg{
+				CommandValid: true,
+				Command:      command,
+				CommandIndex: index + 1,
+			}
+		} else {
+			fmt.Printf("apply success, commitIndex: %d\n", rf.commitIndex)
 			rf.lastApplied = rf.commitIndex
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      command,
+				CommandIndex: index,
+			}
+		}
+	}
+	fmt.Printf("Start return, index: %d, term: %d, isleader: %v\n", index, term, isLeader)
+	return index, term, isLeader
+}
+
+func (rf *Raft) RetryStart(command interface{}, index int) (int, int, bool) {
+	term := rf.currentTerm
+	isLeader := rf.status == LEADER
+
+	if rf.status == LEADER {
+		fmt.Printf("RetryStart index: %d command %+v\n", index, command)
+		successNum := 0
+		for successNum <= len(rf.peers)/2 {
+			successNum = 0
+			for i := 0; i < len(rf.peers); i += 1 {
+				// fmt.Printf("rf.nextIndex[%d]: %v\n", i, rf.nextIndex[i])
+				//if rf.nextIndex[i] >= index {
+				//	successNum += 1
+				//}
+				replies := rf.sendMsg(MSG_APPLY_ENTRY, &RequestAppendEntryArgs{
+					Log:      command,
+					LeaderId: rf.me,
+					LogId:    index,
+				}, index, i)
+				rep := replies[0].(*RequestAppendEntryReply)
+				// fmt.Printf("RetryStart %d -> %d rep %+v, %p\n", rf.me, i, rep, rep)
+				if rep.Success == false {
+					go rf.sendHistoryMsgs(i, index)
+				} else {
+					rf.nextIndex[i] = index
+					successNum += 1
+				}
+			}
+			// fmt.Printf("RetryStart command %+v successNum: %d\n", command, successNum)
+		}
+		fmt.Printf("RetryStart apply success, commitIndex: %d\n", rf.commitIndex)
+		rf.lastApplied = rf.commitIndex - 1
+		rf.applyCh <- ApplyMsg{
+			CommandValid: true,
+			Command:      command,
+			CommandIndex: rf.lastApplied,
 		}
 	}
 	return index, term, isLeader
@@ -386,7 +451,7 @@ func (rf *Raft) Kill() {
 
 func (rf *Raft)initLeader()  {
 	for i := 0; i < len(rf.peers); i += 1 {
-		rf.nextIndex[i] = rf.commitIndex + 1
+		rf.nextIndex[i] = rf.commitIndex
 		rf.matchIndex[i] = 0
 	}
 }
@@ -416,16 +481,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 
 	rf.voteEachTerm = make([]int, MsgRingSize)
-	rf.msg = make([]interface{}, MsgRingSize)
+	rf.logs = make([]interface{}, MsgRingSize)
 	rf.commitIndex = 1
+	rf.lastApplied = 1
 
 	// heartbeat channel
 	rf.heartBeatChan = make(chan ApplyMsg)
 
+	rf.retryChan = make(chan ApplyMsg)
+
 	// stop channel
 	rf.stopChan = make(chan bool)
 
-	// msg channel
+	// logs channel
 	rf.applyCh = applyCh
 
 	// for leader
@@ -454,9 +522,20 @@ func (rf *Raft) process() {
 			case <- time.After(time.Millisecond * time.Duration(waitTime)):
 				// fmt.Printf("%d timeout and will ask for vote\n", rf.me)
 				rf.status = FOLLOWER
-			case <-rf.heartBeatChan:
-				// fmt.Printf("%d receive msg with id: %d\n", rf.me, msg.CommandIndex)
+			case msg := <-rf.heartBeatChan:
+				applyEnd := msg.Command.(int)
+				// fmt.Printf("%d now apply: %d receive lastApplied: %d\n", rf.me, rf.lastApplied, applyEnd)
+				for i := rf.lastApplied; i < applyEnd; i += 1 {
+					rf.applyCh <- ApplyMsg{
+						CommandValid: true,
+						Command:      rf.logs[i],
+						CommandIndex: i,
+					}
+					rf.lastApplied = i
+				}
 				time.Sleep(time.Millisecond * time.Duration(HEARTBEAT_INTERVAL))
+			case msg := <- rf.retryChan:
+				go rf.RetryStart(msg.Command, msg.CommandIndex)
 			}
 		} else if rf.status == FOLLOWER {
 			rand.Seed(time.Now().UnixNano())
@@ -467,8 +546,17 @@ func (rf *Raft) process() {
 				return
 			case <- time.After(time.Millisecond * time.Duration(waitTime)):
 				//fmt.Printf("%d timeout and will ask for vote\n", rf.me)
-			case <-rf.heartBeatChan:
-				//fmt.Printf("%d receive msg with id: %d\n", rf.me, msg.CommandIndex)
+			case msg := <-rf.heartBeatChan:
+				applyEnd := msg.Command.(int)
+				// fmt.Printf("%d now apply: %d receive lastApplied: %d\n", rf.me, rf.lastApplied, applyEnd)
+				for i := rf.lastApplied; i < applyEnd; i += 1 {
+					rf.applyCh <- ApplyMsg {
+						CommandValid: true,
+						Command:  rf.logs[i],
+						CommandIndex: i,
+					}
+					rf.lastApplied = i
+				}
 				time.Sleep(time.Millisecond * time.Duration(HEARTBEAT_INTERVAL))
 				continue
 			}
@@ -514,15 +602,17 @@ func (rf *Raft) sendMsg(msgTye int, msg interface{}, msgId int, who int) []inter
 	case MSG_ASK_VOTE:
 		rsp := make([]interface{}, severNum)
 		for i := 0; i < severNum; i += 1 {
-			rsp[i] = &RequestVoteReply{}
+			rsp[i] = new(RequestVoteReply)
 			go rf.sendRequestVote(i, msg.(*RequestVoteArgs), rsp[i].(*RequestVoteReply))
 		}
 		return rsp
 	case MSG_HERATBEAT:
+		// fmt.Printf("%d send heartbeat with LeaderCommit: %d\n", rf.me, rf.lastApplied)
 		req := &RequestAppendEntryArgs {
-			Term:     rf.currentTerm,
-			LeaderId: rf.me,
-			Msg: LEADER_HEARTBEAT,
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			Log:          LEADER_HEARTBEAT,
+			LeaderCommit: rf.lastApplied,
 		}
 		// 心跳，不需要reply
 		for i := 0; i < severNum; i += 1 {
@@ -533,18 +623,19 @@ func (rf *Raft) sendMsg(msgTye int, msg interface{}, msgId int, who int) []inter
 		req := RequestAppendEntryArgs {
 			Term:     rf.currentTerm,
 			LeaderId: rf.me,
-			MsgId: msgId,
-			Msg:  msg,
+			LogId:    msgId,
+			Log:      msg,
 		}
 		rsp := make([]interface{}, severNum)
 		for i := 0; i < severNum; i += 1 {
-			rsp[i] = &RequestAppendEntryReply{}
+			rsp[i] = new(RequestAppendEntryReply)
 			rf.sendRequestAppendEntry(i, &req, rsp[i].(*RequestAppendEntryReply))
 		}
 		return rsp
 	case MSG_APPLY_ENTRY:
 		rsp := make([]interface{}, 1)
-		rsp[0] = &RequestAppendEntryReply{}
+		realRsp := new(RequestAppendEntryReply)
+		rsp[0] = realRsp
 		rf.sendRequestAppendEntry(who, msg, rsp[0].(*RequestAppendEntryReply))
 		return rsp
 	case MSG_STOP:
