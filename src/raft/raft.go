@@ -19,6 +19,7 @@ package raft
 
 import (
 	"../labrpc"
+	"context"
 	"fmt"
 	"math"
 	"math/rand"
@@ -33,6 +34,7 @@ const LEADER = 1
 const FOLLOWER = 2
 const CANDIDATE = 3
 const LEADER_HEARTBEAT = math.MinInt32
+const LEADER_BLANK_ENTRY = math.MinInt32 + 1
 
 const HEARTBEAT_INTERVAL = 50
 const VOTE_INTERVAL = 200
@@ -91,6 +93,7 @@ type Raft struct {
 	logs         []LogEntry
 
 	/*
+	 * log[0]默认已经提交了
 	 * 已知已提交的最高的日志条目的索引（初始值为0，单调递增）
 	 */
 	commitIndex int
@@ -227,7 +230,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	其他节点收到消息时，如果发现自己的日志比RPC请求中携带的更新，拒绝投票。
 	日志比较的原则是，如果本地的最后一条log entry的term id更大，则更新，如果term id一样大，则日志更多的更大(index更大)。
 	 */
-	if args.LastLogIndex < rf.commitIndex {
+	if args.LastLogIndex < rf.lastApplied {
 		rf.status = FOLLOWER
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
@@ -242,11 +245,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		reply.Term = rf.currentTerm
 		rf.voteEachTerm[pos] = args.CandidateId
-		//fmt.Printf("[%d] vote for candidate %d in term %d\n", rf.me, args.CandidateId, args.Term)
+		fmt.Printf("[RequestVote] [%d] vote for candidate %d in term %d\n", rf.me, args.CandidateId, args.Term)
 	} else {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
-		//fmt.Printf("[%d] reject for candidate %d in term %d\n", rf.me, args.CandidateId, args.Term)
+		fmt.Printf("[RequestVote] [%d] reject for candidate %d in term %d\n", rf.me, args.CandidateId, args.Term)
 	}
 }
 
@@ -267,7 +270,8 @@ func (rf *Raft) RequestAppendEntry(args *RequestAppendEntryArgs, reply *RequestA
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		fmt.Printf("[RequestAppendEntry-A] from %d[%d] to %d[%d], arg: %+v, reply: %v, rf.Term: %d\n", args.LeaderId, args.LogId, rf.me, rf.commitIndex, args, reply, rf.currentTerm)
+		fmt.Printf("[RequestAppendEntry-A] from %d[%d] to %d[%d], arg: %+v, reply: %v, rf.Term: %d\n",
+			args.LeaderId, args.LogId, rf.me, rf.commitIndex, args, reply, rf.currentTerm)
 		return
 	}
 
@@ -283,20 +287,40 @@ func (rf *Raft) RequestAppendEntry(args *RequestAppendEntryArgs, reply *RequestA
 			Command:      args.LeaderCommit,
 			CommandIndex: args.LogId,
 		}
+	} else if args.Log == LEADER_BLANK_ENTRY {
+		// 5. 如果领导者的已知已经提交的最高的日志条目的索引 大于 接收者的已知已经提交的最高的日志条目的索引
+		// 则把 接收者的已知已经提交的最高的日志条目的索引 重置为
+		// 领导者的已知已经提交的最高的日志条目的索引 或者是 上一个新条目的索引 取两者的最小值
+		if args.LeaderCommit > rf.lastApplied {
+			newLastApply := 0
+			if args.LeaderCommit < rf.commitIndex {
+				newLastApply = args.LeaderCommit
+			} else {
+				newLastApply = rf.commitIndex
+			}
+			for i := rf.lastApplied + 1; i <= newLastApply; i += 1 {
+				rf.applyCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      rf.logs[i].Log,
+					CommandIndex: i,
+				}
+			}
+		}
 	} else {
 		rf.mu.Lock()
 		if rf.logs[args.LogId - 1].Term == args.PrevLogTerm {
-			if args.LogId == rf.commitIndex {
-				// logId位置还没添加新的日志条目，则直接追加
-				rf.logs[rf.commitIndex].Log = args.Log
-				rf.logs[rf.commitIndex].Term = args.LogTerm
-				fmt.Printf("[RequestAppendEntry-B], append new entry: rf[%d].logs[%d]: %+v\n", rf.me, rf.commitIndex, rf.logs[rf.commitIndex])
-				rf.commitIndex += 1
-			} else if rf.commitIndex > args.LogId {
+			if args.LogId == rf.commitIndex + 1 {
+				// logId，正好是下一个要append entry的位置
+				index := rf.commitIndex + 1
+				rf.logs[index].Log = args.Log
+				rf.logs[index].Term = args.LogTerm
+				fmt.Printf("[RequestAppendEntry-B], append new entry: rf.logs[%d][%d]: %+v\n",
+					rf.me, index, rf.logs[index])
+				rf.commitIndex = index
+			} else if rf.commitIndex >= args.LogId {
 				// logId位置已经添加过日志
-
 				if rf.logs[args.LogId].Log == args.Log && rf.logs[args.LogId].Term == args.Term  {
-					// 日志相同，返回true
+					// 日志相同，返回true(可能是网络延迟收到的旧包）
 					reply.Success = true
 					reply.Term = rf.currentTerm
 					fmt.Printf("[RequestAppendEntry-C], %d received a past log %+v and return success: %+v\n", rf.me, args, reply)
@@ -307,20 +331,19 @@ func (rf *Raft) RequestAppendEntry(args *RequestAppendEntryArgs, reply *RequestA
 					rf.logs[rf.commitIndex].Log = args.Log
 					rf.logs[rf.commitIndex].Term = args.LogTerm
 					fmt.Printf("[RequestAppendEntry-D], append exist entry: rf[%d].logs[%d]: %+v\n", rf.me, rf.commitIndex, rf.logs[rf.commitIndex])
-					rf.commitIndex += 1
 				}
 			}
 			// 5. 如果领导者的已知已经提交的最高的日志条目的索引 大于 接收者的已知已经提交的最高的日志条目的索引
 			// 则把 接收者的已知已经提交的最高的日志条目的索引 重置为
 			// 领导者的已知已经提交的最高的日志条目的索引 或者是 上一个新条目的索引 取两者的最小值
 			if args.LeaderCommit > rf.lastApplied {
-				newApply := 0
-				if args.LeaderCommit < rf.commitIndex - 1 {
-					newApply = args.LeaderCommit
+				newLastApply := 0
+				if args.LeaderCommit < rf.commitIndex {
+					newLastApply = args.LeaderCommit
 				} else {
-					newApply = rf.commitIndex - 1
+					newLastApply = rf.commitIndex
 				}
-				for i := rf.lastApplied; i <= newApply; i += 1 {
+				for i := rf.lastApplied + 1; i <= newLastApply; i += 1 {
 					rf.applyCh <- ApplyMsg{
 						CommandValid: true,
 						Command:      rf.logs[i].Log,
@@ -330,7 +353,7 @@ func (rf *Raft) RequestAppendEntry(args *RequestAppendEntryArgs, reply *RequestA
 			}
 			reply.Success = true
 			reply.Term = rf.currentTerm
-			fmt.Printf("rf.logs[%d][%d] %+v, arg: %+v, rep: %+v\n", rf.me, args.LogId, rf.logs[rf.commitIndex - 1].Log, args, reply)
+			fmt.Printf("rf.logs[%d][%d] %+v, arg: %+v, rep: %+v\n", rf.me, args.LogId, rf.logs[rf.commitIndex].Log, args, reply)
 		} else {
 			reply.Success = false
 			reply.Term = rf.currentTerm
@@ -382,6 +405,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		// 如果接收到的 RPC 请求或响应中，任期号`T > currentTerm`，那么就令 currentTerm 等于 T，并切换状态为跟随者
 		if reply.Term > rf.currentTerm {
 			rf.currentTerm = reply.Term
+			if rf.status == LEADER {
+				fmt.Printf("leader %d change to follower\n", rf.me)
+			}
 			rf.status = FOLLOWER
 		}
 		return true
@@ -405,6 +431,9 @@ func (rf *Raft) sendRequestAppendEntry(server int, args interface{}, reply *Requ
 		// 如果接收到的 RPC 请求或响应中，任期号`T > currentTerm`，那么就令 currentTerm 等于 T，并切换状态为跟随者
 		if reply.Term > rf.currentTerm {
 			rf.currentTerm = reply.Term
+			if rf.status == LEADER {
+				fmt.Printf("leader %d change to follower\n", rf.me)
+			}
 			rf.status = FOLLOWER
 		}
 		return true
@@ -415,61 +444,74 @@ func (rf *Raft) sendRequestAppendEntry(server int, args interface{}, reply *Requ
 }
 
 
-func (rf *Raft) sendHistoryMsgs(who int) {
-	msgId := rf.commitIndex - 1
-	for ; msgId > 0; msgId -= 1 {
-		rf.mu.Lock()
-		varLog := rf.logs[msgId].Log
-		varPreTerm := rf.logs[msgId-1].Term
-		varLogTerm := rf.logs[msgId].Term
-		rf.mu.Unlock()
-		replies := rf.sendMsg(MSG_APPLY_ENTRY, &RequestAppendEntryArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			Log:          varLog,
-			LogId:        msgId,
-			PrevLogIndex: msgId - 1,
-			PrevLogTerm:  varPreTerm,
-			LogTerm:  varLogTerm,
-			LeaderCommit: rf.lastApplied,
-		}, msgId, who)
-		rpy := replies[0].(*RequestAppendEntryReply)
-		fmt.Printf("%d sendHistoryMsgs to %d msgId: %d, rep: %+v\n", rf.me, who, msgId, rpy)
-		if rpy.Success == false {
-			if msgId > 1 {
-				continue
+func (rf *Raft) sendHistoryMsgs(who int, ctx context.Context) {
+	select {
+	case <- ctx.Done():
+		rf.appendHistoryFlag[who] = false
+		fmt.Printf("[appendLog] leader: %d(commitIndex: %d) cancel sync to follower: %d(nextIndex: %d)\n",
+			rf.me, rf.commitIndex, who, rf.nextIndex[who])
+		return
+	default:
+		msgId := rf.commitIndex
+		for ; msgId > 1; msgId -= 1 {
+			rf.mu.Lock()
+			varLog := rf.logs[msgId].Log
+			varPreTerm := rf.logs[msgId - 1].Term
+			varLogTerm := rf.logs[msgId].Term
+			rf.mu.Unlock()
+			replies := rf.sendMsg(MSG_APPLY_ENTRY, &RequestAppendEntryArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				Log:          varLog,
+				LogId:        msgId,
+				PrevLogIndex: msgId - 1,
+				PrevLogTerm:  varPreTerm,
+				LogTerm:      varLogTerm,
+				LeaderCommit: rf.lastApplied,
+			}, msgId, who)
+			rpy := replies[0].(*RequestAppendEntryReply)
+			fmt.Printf("%d sendHistoryMsgs to %d msgId: %d, rep: %+v\n", rf.me, who, msgId, rpy)
+			if rpy.Success == false {
+				if msgId > 1 {
+					continue
+				} else {
+					msgId = 1
+					break
+				}
 			} else {
-				msgId = 1
 				break
 			}
-		} else {
-			break
 		}
-	}
-	fmt.Printf("start sync at port: %d\n", msgId)
-	for syncPot := msgId; syncPot < rf.commitIndex-1; syncPot += 1 {
-		rf.mu.Lock()
-		varLog := rf.logs[syncPot].Log
-		varPreTerm := rf.logs[syncPot-1].Term
-		varLogTerm := rf.logs[msgId].Term
-		rf.mu.Unlock()
-		replies := rf.sendMsg(MSG_APPLY_ENTRY, &RequestAppendEntryArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			Log:          varLog,
-			LogId:        syncPot,
-			PrevLogIndex: syncPot - 1,
-			PrevLogTerm:  varPreTerm,
-			LogTerm: varLogTerm,
-			LeaderCommit: rf.lastApplied,
-		}, msgId, who)
-		rpy := replies[0].(*RequestAppendEntryReply)
-		fmt.Printf("%d sendHistoryMsgs to %d msgId: %d, rep: %+v\n", rf.me, who, msgId, rpy)
-		if rpy.Success == false {
-			break
+		fmt.Printf("start sync at port: %d\n", msgId)
+		for syncPot := msgId; syncPot <= rf.commitIndex; syncPot += 1 {
+			rf.mu.Lock()
+			varLog := rf.logs[syncPot].Log
+			varPreTerm := rf.logs[syncPot-1].Term
+			varLogTerm := rf.logs[msgId].Term
+			rf.mu.Unlock()
+			replies := rf.sendMsg(MSG_APPLY_ENTRY, &RequestAppendEntryArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				Log:          varLog,
+				LogId:        syncPot,
+				PrevLogIndex: syncPot - 1,
+				PrevLogTerm:  varPreTerm,
+				LogTerm:      varLogTerm,
+				LeaderCommit: rf.lastApplied,
+			}, msgId, who)
+			rpy := replies[0].(*RequestAppendEntryReply)
+			fmt.Printf("%d sendHistoryMsgs to %d msgId: %d, rep: %+v\n", rf.me, who, msgId, rpy)
+			if rpy.Success == false {
+				break
+			} else {
+				rf.nextIndex[who] = syncPot + 1
+				rf.matchIndex[who] = syncPot
+			}
 		}
+		rf.appendHistoryFlag[who] = false
+		fmt.Printf("[appendLog] leader: %d(commitIndex: %d) finish sync to follower: %d(nextIndex: %d)\n",
+			rf.me, rf.commitIndex, who, rf.nextIndex[who])
 	}
-	rf.appendHistoryFlag[who] = false
 }
 
 //
@@ -487,27 +529,46 @@ func (rf *Raft) sendHistoryMsgs(who int) {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := rf.commitIndex
+	// 当前log应该append的position
+	index := rf.commitIndex + 1
 	term := rf.currentTerm
 	isLeader := rf.status == LEADER
 
 	// Your code here (2B).
 	if rf.status == LEADER {
 		successNum := 0
-		replies := rf.sendMsg(MSG_BROADCAST_APPLY_ENTRY, command, index, BROADCAST)
 		for i := 0; i < len(rf.peers); i += 1 {
-			rep := replies[i].(*RequestAppendEntryReply)
-			// fmt.Printf("start %d -> %d rep %+v\n", rf.me, i, rep)
-			if !rep.Success {
-				// rf.nextIndex[i] = index - 1
-				// rf.sendHistoryMsgs(i, index)
-			} else {
-				rf.nextIndex[i] = index
+			if i == rf.me {
+				continue
+			}
+
+			// ask follower to append
+			request := &RequestAppendEntryArgs{
+				Term:         term,
+				LeaderId:     rf.me,
+				Log:          command,
+				LogId:        index,
+				PrevLogIndex: index - 1,
+				PrevLogTerm:  rf.logs[index - 1].Term,
+				LogTerm:      term,
+				LeaderCommit: rf.lastApplied,
+			}
+			replies := rf.sendMsg(MSG_APPLY_ENTRY, request, index, i)
+			rep := replies[0].(*RequestAppendEntryReply)
+			if rep.Success {
+				rf.nextIndex[0] = index
 				successNum += 1
 			}
 		}
-		fmt.Printf("send command %+v, successNum: %d\n", command,successNum )
-		if successNum > len(rf.peers)/2 {
+
+		// leader先自己append log
+		// logId位置还没添加新的日志条目，则直接追加
+		rf.logs[index].Log = command
+		rf.logs[index].Term = rf.currentTerm
+		rf.commitIndex = index
+		fmt.Printf("[Start-A], append new entry: rf.logs[%d][%d]: %+v\n", rf.me, rf.commitIndex, rf.logs[rf.commitIndex])
+
+		if successNum + 1 > len(rf.peers)/2 {
 			fmt.Printf("apply success, commitIndex: %d, leader %d apply %d now\n", rf.commitIndex, rf.me, command)
 			rf.lastApplied = rf.commitIndex
 			rf.applyCh <- ApplyMsg{
@@ -517,16 +578,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			}
 		} else {
 			fmt.Printf("apply failed and retry, command: %d, index: %d, successNum: %d\n", command.(int), index, successNum)
-			/*
-			rf.retryChan <- ApplyMsg{
-				CommandValid: true,
-				Command:      command,
-				CommandIndex: index,
-			}
-			 */
 		}
 	}
-	// fmt.Printf("Start return, index: %d, term: %d, isleader: %v\n", index, term, isLeader)
 	return index, term, isLeader
 }
 
@@ -604,13 +657,23 @@ func (rf *Raft) Kill() {
 
 func (rf *Raft)initLeader()  {
 	for i := 0; i < len(rf.peers); i += 1 {
-		if rf.commitIndex - 2 > 0 {
-			rf.nextIndex[i] = rf.commitIndex - 2
-		} else {
-			rf.nextIndex[i] = 0
-		}
+		rf.nextIndex[i] = rf.commitIndex + 1
 		rf.matchIndex[i] = 0
+		// 先发个心跳
+		rf.sendMsg(MSG_HERATBEAT, nil, NO_MSG_ID, i)
+		// 发送空的entry，把前面的entry都直接apply
+		rf.sendMsg(MSG_APPLY_ENTRY,&RequestAppendEntryArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			Log:          LEADER_BLANK_ENTRY,
+			LogId:        rf.commitIndex + 1,
+			PrevLogIndex: rf.commitIndex ,
+			PrevLogTerm:  rf.logs[rf.commitIndex].Term,
+			LogTerm:      rf.currentTerm,
+			LeaderCommit: rf.commitIndex,
+		} , rf.commitIndex + 1, i)
 	}
+	rf.lastApplied = rf.commitIndex
 }
 
 //
@@ -639,17 +702,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.voteEachTerm = make([]int, MsgRingSize)
 	rf.logs = make([]LogEntry, MsgRingSize)
-	rf.commitIndex = 1
-	rf.lastApplied = 1
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 
 	// heartbeat channel
 	rf.heartBeatChan = make(chan ApplyMsg)
-
-	// rf.retryChan = make(chan ApplyMsg)
-
 	// stop channel
 	rf.stopChan = make(chan bool)
-
 	// logs channel
 	rf.applyCh = applyCh
 
@@ -666,7 +725,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-func (rf *Raft) appendLog()  {
+func (rf *Raft) appendLog(ctx context.Context)  {
 	serverNum := len(rf.peers)
 	/*
 	 * 如果对于一个跟随者，最后日志条目的索引值大于等于 nextIndex，那么：发送从 nextIndex 开始的所有日志条目：
@@ -674,22 +733,24 @@ func (rf *Raft) appendLog()  {
 	 * 如果因为日志不一致而失败，减少 nextIndex 重试
 	 */
 	for i := 0; i < serverNum; i += 1 {
+		if i == rf.me {
+			continue
+		}
 		fmt.Printf("[appendLog] leader: %d(commitIndex: %d) to follower: %d(nextIndex: %d)\n",
 			rf.me, rf.commitIndex, i, rf.nextIndex[i])
-
-		if rf.nextIndex[i] < rf.commitIndex - 1 {
-			//go func() {
+		if rf.nextIndex[i] > rf.commitIndex && rf.commitIndex > 0 {
 			if rf.appendHistoryFlag[i] == false {
 				rf.appendHistoryFlag[i] = true
-				go rf.sendHistoryMsgs(i)
+				fmt.Printf("[appendLog] leader: %d(commitIndex: %d) start sync to follower: %d(nextIndex: %d)\n",
+					rf.me, rf.commitIndex, i, rf.nextIndex[i])
+				go rf.sendHistoryMsgs(i, ctx)
 			}
-			//}()
-
 		}
 	}
 }
 
 func (rf *Raft) process() {
+	ctx := context.Background()
 	for true {
 		if rf.status == LEADER {
 			rand.Seed(time.Now().UnixNano())
@@ -701,12 +762,14 @@ func (rf *Raft) process() {
 				rf.status = FOLLOWER
 			case <- time.After(time.Millisecond * time.Duration(HEARTBEAT_INTERVAL)):
 				rf.sendMsg(MSG_HERATBEAT, nil, NO_MSG_ID, BROADCAST)
-			case msg := <-rf.heartBeatChan:
+			case <-rf.heartBeatChan:
+				// leader的log不用在心跳里面处理
+				/*
 				rf.mu.Lock()
 				applyEnd := msg.CommandIndex + 1
-				fmt.Printf("%d now apply: %d receive lastApplied: %d, commitIndex: %d\n", rf.me, rf.lastApplied, applyEnd, rf.commitIndex)
+				fmt.Printf("[HeartBeat-leader] %d now lastApplied: %d, commitIndex: %d receive lastApplied: %d\n",
+					rf.me, rf.lastApplied, rf.commitIndex, applyEnd)
 				for i := rf.lastApplied; i < applyEnd; i += 1 {
-					fmt.Printf("a %d now apply: %+v, id: %d\n", rf.me, rf.logs[i].Log, i)
 					varCommand := rf.logs[i].Log
 					rf.lastApplied = i
 					rf.applyCh <- ApplyMsg {
@@ -714,29 +777,31 @@ func (rf *Raft) process() {
 						Command:  varCommand,
 						CommandIndex: i,
 					}
+					fmt.Printf("[HeartBeat-leader] %d now apply: %+v, lastApplied: %d, commitIndex: %d\n",
+						rf.me, rf.logs[i].Log, rf.lastApplied, rf.commitIndex)
 				}
 				rf.mu.Unlock()
-			/*
-			case msg := <- rf.retryChan:
-				rf.RetryStart(msg)
-			 */
+				 */
 			}
-			rf.appendLog()
+			//ctx = context.Background()
+			//ctx, cancel = context.WithCancel(ctx)
+			rf.appendLog(ctx)
 		} else if rf.status == FOLLOWER {
 			rand.Seed(time.Now().UnixNano())
 			waitTime := rand.Intn(VOTE_INTERVAL) + VOTE_INTERVAL
-
+			// cancel()
 			select {
 			case <- rf.stopChan:
 				return
 			case <- time.After(time.Millisecond * time.Duration(waitTime)):
-				//fmt.Printf("%d timeout and will ask for vote\n", rf.me)
+				fmt.Printf("%d timeout %d and will ask for vote\n", rf.me, waitTime)
 			case msg := <-rf.heartBeatChan:
+				// leader已经应用了position在applyEnd的log
 				applyEnd := msg.Command.(int)
 				rf.mu.Lock()
-				fmt.Printf("%d now apply: %d receive lastApplied: %d, commitIndex: %d\n", rf.me, rf.lastApplied, applyEnd, rf.commitIndex)
-				for i := rf.lastApplied; i < applyEnd && i < rf.commitIndex; i += 1 {
-					fmt.Printf("b %d now apply: %+v, id: %d\n", rf.me, rf.logs[i].Log, i)
+				fmt.Printf("[HeartBeat-follower] %d now lastApplied: %d, commitIndex: %d receive lastApplied: %d\n",
+					rf.me, rf.lastApplied, rf.commitIndex, applyEnd)
+				for i := rf.lastApplied + 1; i <= applyEnd && i <= rf.commitIndex; i += 1 {
 					varCommand := rf.logs[i].Log
 					rf.lastApplied = i
 					rf.applyCh <- ApplyMsg {
@@ -744,44 +809,40 @@ func (rf *Raft) process() {
 						Command:  varCommand,
 						CommandIndex: i,
 					}
+					fmt.Printf("[HeartBeat-follower] %d now apply: %+v, lastApplied: %d, commitIndex: %d\n",
+						rf.me, rf.logs[i].Log, rf.lastApplied, rf.commitIndex)
 				}
 				rf.mu.Unlock()
 				continue
 			}
 
-			// ask for vote
+			// 开始请求投票
 			severNum := len(rf.peers)
 			rf.currentTerm += 1
 			req := RequestVoteArgs{
-				Term:        rf.currentTerm,
-				CandidateId: rf.me,
+				Term:         rf.currentTerm,
+				CandidateId:  rf.me,
 				LastLogIndex: rf.commitIndex,
-				LastLogTerm: rf.logs[rf.commitIndex - 1].Term,
+				LastLogTerm:  rf.logs[rf.commitIndex].Term,
 			}
-
-			fmt.Printf("[process] %d ask for vote with term %d\n", rf.me, rf.currentTerm)
 			voteCount := 0
 			rsp := rf.sendMsg(MSG_ASK_VOTE, &req, NO_MSG_ID, BROADCAST)
-
-			select {
-			case <- time.After(time.Millisecond * time.Duration(VOTE_INTERVAL)):
-				for i := 0; i < severNum; i += 1 {
-					if rsp[i].(*RequestVoteReply).VoteGranted == true {
-						voteCount += 1
-					}
-					if rsp[i].(*RequestVoteReply).Term > rf.currentTerm {
-						rf.currentTerm = rsp[i].(*RequestVoteReply).Term
-					}
+			for i := 0; i < severNum; i += 1 {
+				if rsp[i].(*RequestVoteReply).VoteGranted == true {
+					voteCount += 1
+				}
+				if rsp[i].(*RequestVoteReply).Term > rf.currentTerm {
+					rf.currentTerm = rsp[i].(*RequestVoteReply).Term
 				}
 			}
 
+			// 处理投票结果
 			if voteCount > severNum / 2 {
 				rf.status = LEADER
 				rf.initLeader()
 				fmt.Printf("-------\n%d ask for vote and success with term %d\n", rf.me, rf.currentTerm)
 			} else {
 				rf.status = FOLLOWER
-				//fmt.Printf("%d ask for vote but failed with term %d\n", rf.me, rf.currentTerm)
 			}
 		}
 	}
@@ -791,14 +852,20 @@ func (rf *Raft) sendMsg(msgTye int, msg interface{}, msgId int, who int) []inter
 	severNum := len(rf.peers)
 	switch msgTye {
 	case MSG_ASK_VOTE:
-		rsp := make([]interface{}, severNum)
-		for i := 0; i < severNum; i += 1 {
-			rsp[i] = new(RequestVoteReply)
-			rf.sendRequestVote(i, msg.(*RequestVoteArgs), rsp[i].(*RequestVoteReply))
+		if who == BROADCAST {
+			rsp := make([]interface{}, severNum)
+			for i := 0; i < severNum; i += 1 {
+				rsp[i] = new(RequestVoteReply)
+				rf.sendRequestVote(i, msg.(*RequestVoteArgs), rsp[i].(*RequestVoteReply))
+			}
+			return rsp
+		} else {
+			rsp := make([]interface{}, 1)
+			rsp[0] = new(RequestVoteReply)
+			rf.sendRequestVote(who, msg.(*RequestVoteArgs), rsp[0].(*RequestVoteReply))
+			return rsp
 		}
-		return rsp
 	case MSG_HERATBEAT:
-		// fmt.Printf("%d send heartbeat with LeaderCommit: %d\n", rf.me, rf.lastApplied)
 		req := &RequestAppendEntryArgs {
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
