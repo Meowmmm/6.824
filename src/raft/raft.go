@@ -532,8 +532,11 @@ func (rf *Raft) sendHistoryMsgs(who int, ctx context.Context) {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	fmt.Printf("start command: %d\n", command)
 	// 当前log应该append的position
-	rf.rwLock.RLock()
+	rf.rwLock.Lock()
+	defer rf.rwLock.Unlock()
+
 	index := rf.commitIndex + 1
 	term := rf.currentTerm
 	isLeader := rf.status == LEADER
@@ -547,7 +550,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		LogTerm:      term,
 		LeaderCommit: rf.lastApplied,
 	}
-	rf.rwLock.RUnlock()
+	// rf.rwLock.RUnlock()
 
 	// Your code here (2B).
 	if rf.status == LEADER {
@@ -561,13 +564,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			replies := rf.sendMsg(MSG_APPLY_ENTRY, request, index, i)
 			rep := replies[0].(*RequestAppendEntryReply)
 			if rep.Success {
-				rf.nextIndex[0] = index
+				rf.nextIndex[i] = index
 				successNum += 1
 			}
 		}
 		// leader先自己append log
 		// logId位置还没添加新的日志条目，则直接追加
-		rf.rwLock.Lock()
+		// rf.rwLock.Lock()
 		rf.logs[index].Log = command
 		rf.logs[index].Term = rf.currentTerm
 		rf.commitIndex = index
@@ -584,7 +587,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		} else {
 			fmt.Printf("apply failed and retry, command: %d, index: %d, successNum: %d\n", command.(int), index, successNum)
 		}
-		rf.rwLock.Unlock()
+		// rf.rwLock.Unlock()
 	}
 	return index, term, isLeader
 }
