@@ -19,5 +19,9 @@ do
     go test -run TestFailAgree2B > ./$1
     grep Pass ./$1 || echo "failed" | exit 1
    
+    echo "TestFailNoAgree2B"
+    go test -run TestFailNoAgree2B  > ./$1
+    grep Pass ./$1 || echo "failed" | exit 1
+
     let i+=1
 done
